@@ -262,8 +262,16 @@ If the loan transaction did not work out and needs to be refunded then the *lend
 
 # Process $paid_with_id command
 def process_paid_command(comment):
+    # First, check if the command is in a code block and extract it
+    code_block_regex = r'```\s*(.*?)\s*```'
+    code_blocks = re.findall(code_block_regex, comment.body, re.DOTALL)
+    
+    # Text to search - either the code block content or the full comment body
+    text_to_search = code_blocks[0] if code_blocks else comment.body
+    
+    # Now search for the paid command
     paid_regex = r'\$paid_with_id\s+(\d+)\s+(\d+(?:\.\d+)?)\s+([A-Z]{3})'
-    match = re.search(paid_regex, comment.body, re.IGNORECASE)
+    match = re.search(paid_regex, text_to_search, re.IGNORECASE)
     
     if not match:
         return
