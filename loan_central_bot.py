@@ -6,6 +6,7 @@ import logging
 import os
 from datetime import datetime, timedelta  # Added missing timedelta import
 from dotenv import load_dotenv
+from functools import wraps
 import threading
 import sys
 from decimal import Decimal  # Import Decimal type
@@ -28,12 +29,22 @@ logger = logging.getLogger("LoanCentral")
 
 # Reddit API credentials
 reddit = praw.Reddit(
-    client_id=os.getenv("REDDIT_CLIENT_ID"),
+        client_id=os.getenv("REDDIT_CLIENT_ID"),
     client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
     username=os.getenv("REDDIT_USERNAME"),
     password=os.getenv("REDDIT_PASSWORD"),
-    user_agent=os.getenv("USER_AGENT")
+    user_agent=os.getenv("REDDIT_USER_AGENT")
 )
+
+# Multi-subreddit support
+SUBREDDITS = os.getenv("SUBREDDITS", os.getenv("SUBREDDIT", "")).replace(" ", "").split(",")
+SUBREDDITS = [s for s in SUBREDDITS if s]
+if SUBREDDITS:
+    subreddit_str = "+".join(SUBREDDITS)
+else:
+    logger.warning("No subreddits specified. Falling back to single SUBREDDIT env var.")
+    subreddit_str = os.getenv("SUBREDDIT", "")
+ 
 
 # PostgreSQL connection
 def get_db_connection():
@@ -111,6 +122,64 @@ def init_database():
         cur.close()
         conn.close()
 
+
+# Decorator to prevent duplicate confirmations
+def confirm_restriction(func):
+    @wraps(func)
+    def wrapper(comment):
+        # Check if this is a re-confirmation
+        conn = get_db_connection()
+        if not conn:
+            return func(comment)  # Proceed anyway if we can't check
+        
+        try:
+            cur = conn.cursor()
+            # Extract borrower from comment
+            borrower = comment.author.name.lower()
+            
+            # Extract lender from the command - similar to what's in the function
+            confirm_regex = r'\$confirm\s+\/u\/([^\s]+)'
+            match = re.search(confirm_regex, comment.body, re.IGNORECASE)
+            if not match:
+                alt_confirm_regex = r'\$confirm\s+u\/([^\s]+)'
+                match = re.search(alt_confirm_regex, comment.body, re.IGNORECASE)
+                if not match:
+                    return func(comment)  # Can't find lender, let the function handle it
+            
+            lender = match.group(1).lower()
+            
+            # Check if this loan already exists
+            cur.execute('''
+                SELECT id FROM loans
+                WHERE lender = %s AND borrower = %s AND status = 'confirmed'
+                ORDER BY date_created DESC
+                LIMIT 1
+            ''', (lender, borrower))
+            
+            existing = cur.fetchone()
+            if existing:
+                comment.reply(f"Error: You have already confirmed a loan with u/{lender}. If this is a new loan, please ask the lender to use a new $loan command.")
+                return  # Skip the wrapped function
+                
+            # Check if commenter is the OP of the post
+            post = comment.submission
+            if comment.author.name.lower() != post.author.name.lower():
+                comment.reply(f"Error: Only the original requester (u/{post.author.name}) can confirm this loan. If you're the requester but using a different account, please contact the moderators.")
+                return
+                
+            return func(comment)  # Everything looks good, proceed with the function
+            
+        except Exception as e:
+            logger.error(f"Error in confirm_restriction: {e}")
+            logger.error(traceback.format_exc())
+            return func(comment)  # Proceed anyway if there's an error
+        finally:
+            if conn:
+                cur.close()
+                conn.close()
+    
+    return wrapper
+
 # Generate a unique loan ID
 def generate_loan_id():
     current_time = int(time.time())
@@ -159,7 +228,7 @@ The loan will only be registered in the database after confirmation. This helps 
         logger.error(traceback.format_exc())  # Log full stack trace
 
 # Process $confirm command
-# Process $confirm command
+@confirm_restriction
 def process_confirm_command(comment):
     # First, check if the command is in a code block and extract it
     code_block_regex = r'```\s*(.*?)\s*```'
@@ -261,6 +330,7 @@ If the loan transaction did not work out and needs to be refunded then the *lend
         conn.close()
 
 # Process $paid_with_id command
+# Process $paid_with_id command
 def process_paid_command(comment):
     # First, check if the command is in a code block and extract it
     code_block_regex = r'```\s*(.*?)\s*```'
@@ -272,6 +342,10 @@ def process_paid_command(comment):
     # Now search for the paid command
     paid_regex = r'\$paid_with_id\s+(\d+)\s+(\d+(?:\.\d+)?)\s+([A-Z]{3})'
     match = re.search(paid_regex, text_to_search, re.IGNORECASE)
+    
+    # If no match in code block or direct text, try the raw comment body again
+    if not match and code_blocks:
+        match = re.search(paid_regex, comment.body, re.IGNORECASE)
     
     if not match:
         return
@@ -290,7 +364,7 @@ def process_paid_command(comment):
         
         # Find the loan
         cur.execute('''
-            SELECT id, borrower, amount, amount_repaid, currency
+            SELECT id, borrower, amount, amount_repaid, currency, status
             FROM loans
             WHERE id = %s AND lender = %s
         ''', (loan_id, lender))
@@ -301,7 +375,12 @@ def process_paid_command(comment):
             comment.reply(f"Error: Could not find a loan with ID {loan_id} where you are the lender.")
             return
         
-        db_id, borrower, loan_amount, already_repaid, loan_currency = result
+        db_id, borrower, loan_amount, already_repaid, loan_currency, status = result
+        
+        # Check if this loan has already been fully repaid
+        if status == 'repaid':
+            comment.reply(f"Error: This loan (ID {loan_id}) has already been fully repaid.")
+            return
         
         # Ensure all values are Decimal for calculations
         loan_amount = Decimal(loan_amount) if not isinstance(loan_amount, Decimal) else loan_amount
@@ -383,7 +462,7 @@ def process_paid_command(comment):
     except Exception as e:
         conn.rollback()
         logger.error(f"Error processing paid command: {e}")
-        logger.error(traceback.format_exc())  # Log full stack trace
+        logger.error(traceback.format_exc())
     finally:
         cur.close()
         conn.close()
@@ -437,6 +516,10 @@ def process_refund_command(comment):
             return
         
         loan_id = result[0]
+
+        # Notify moderators - get the subreddit from the post
+        post_subreddit = comment.submission.subreddit.display_name
+        subreddit = reddit.subreddit(post_subreddit)
         
         # Update the loan status to refunded
         cur.execute('''
@@ -483,7 +566,90 @@ def process_refund_command(comment):
         cur.close()
         conn.close()
 
-# ----- Account Stats Command -----
+# Process $unpaid command
+# Process $unpaid command
+def process_unpaid_command(comment):
+    # Check for command format
+    unpaid_regex = r'\$unpaid\s+(\d+)\s+u?\/?([\w-]+)'
+    match = re.search(unpaid_regex, comment.body, re.IGNORECASE)
+    
+    if not match:
+        return
+    
+    lender = comment.author.name.lower()
+    loan_id = match.group(1)
+    borrower = match.group(2).lower()
+    
+    conn = get_db_connection()
+    if not conn:
+        return
+    
+    try:
+        cur = conn.cursor()
+        
+        # Find the loan and verify the lender owns it
+        cur.execute('''
+            SELECT id, amount, currency, amount_repaid, original_thread, status
+            FROM loans
+            WHERE id = %s AND lender = %s AND borrower = %s
+        ''', (loan_id, lender, borrower))
+        
+        result = cur.fetchone()
+        if not result:
+            logger.warning(f"No matching loan found for unpaid: ID {loan_id} by {lender} for borrower {borrower}")
+            comment.reply(f"Error: Could not find a loan with ID {loan_id} where you are the lender and u/{borrower} is the borrower.")
+            return
+        
+        db_id, loan_amount, loan_currency, amount_repaid, thread_url, status = result
+        
+        # Ensure not already marked as unpaid
+        if status == 'unpaid':
+            comment.reply(f"This loan has already been marked as unpaid.")
+            return
+        
+        # Update the loan status to unpaid
+        cur.execute('''
+            UPDATE loans
+            SET status = 'unpaid',
+                last_updated = %s
+            WHERE id = %s
+        ''', (datetime.now(), loan_id))
+        
+        # Update user statistics - increment unpaid count for borrower
+        remaining_unpaid = loan_amount - amount_repaid
+        cur.execute('''
+            UPDATE users
+            SET unpaid_loans = unpaid_loans + 1,
+                unpaid_amount = unpaid_amount + %s,
+                last_updated = %s
+            WHERE username = %s
+        ''', (remaining_unpaid, datetime.now(), borrower))
+        
+        conn.commit()
+        logger.info(f"Loan marked as unpaid: Loan ID {loan_id} from {lender} to {borrower}")
+        
+        # Create comprehensive response with details
+        response = f"u/{lender} has marked their loan to u/{borrower} as unpaid.\n\n"
+        response += "This loan has been recorded as unpaid in the database.\n\n"
+        response += "|Lender|Borrower|Amount|Amount Repaid|Date|Original Thread|\n"
+        response += "|:--:|:--:|:--:|:--:|:--:|:--:|\n"
+        response += f"|{lender}|{borrower}|{loan_amount:.2f} {loan_currency}|{amount_repaid:.2f} {loan_currency}|{datetime.now().strftime('%Y-%m-%d')}|[Link]({thread_url})|\n\n"
+        
+        # Add unpaid post link and notice about dispute
+        response += "If you would like to make a loan unpaid post, [use this link](https://www.reddit.com/r/borrow/submit?selftext=true&title=UNPAID:%20/u/"+borrower+"%20"+str(loan_amount)+"%20"+loan_currency+").\n\n"
+        response += "If this is in error, please contact the moderators."
+        
+        comment.reply(response)
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error processing unpaid command: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        cur.close()
+        conn.close()
+
+        
 # ----- Account Stats Command -----
 def process_stats_command(comment):
     # Updated regex to make /u/ optional by using (?:/u/|u/) pattern
@@ -654,9 +820,12 @@ def generate_user_info(username):
         response += f"**Mobile View**\n\n"
         response += f"u/{username} has {loans_as_borrower} loans paid as a borrower, for a total of ${amount_borrowed:.2f}\n\n"
         response += f"u/{username} has {loans_as_lender} loans paid as a lender, for a total of ${amount_lent:.2f}\n\n"
+
+        
         
         if current_unpaid_as_borrower == 0:
             response += f"u/{username} has not received any loans which are currently marked unpaid\n\n"
+        
         else:
             response += f"u/{username} has {current_unpaid_as_borrower} current unpaid loans as borrower\n\n"
         
@@ -737,9 +906,9 @@ def keep_alive():
 def comment_monitor():
     while True:
         try:
-            subreddit = reddit.subreddit(os.getenv("SUBREDDIT"))
+            subreddit = reddit.subreddit(subreddit_str)
             
-            logger.info("Starting comment stream")
+            logger.info(f"Starting comment stream for subreddits: {subreddit_str}")
             for comment in subreddit.stream.comments(skip_existing=True):
                 if comment.author is None or comment.author.name.lower() == os.getenv("REDDIT_USERNAME").lower():
                     continue
@@ -756,7 +925,11 @@ def comment_monitor():
                     process_refund_command(comment)
                 elif "$stats" in body_lower:
                     process_stats_command(comment)
-
+                elif "$unpaid" in body_lower:
+                    process_unpaid_command(comment)
+                elif "$repaid" in body_lower:
+                    process_repaid_command(comment)
+                 
                     
         except Exception as e:
             logger.error(f"Error in comment stream: {e}")
@@ -781,6 +954,112 @@ def post_monitor():
             logger.error(traceback.format_exc())  # Log full stack trace
             logger.info("Reconnecting in 60 seconds...")
             time.sleep(60)  # Wait 60 seconds before reconnecting
+
+
+# Borrower repayment command
+# Borrower repayment command
+def process_repaid_command(comment):
+    # First, check if the command is in a code block and extract it
+    code_block_regex = r'```\s*(.*?)\s*```'
+    code_blocks = re.findall(code_block_regex, comment.body, re.DOTALL)
+    
+    # Text to search - either the code block content or the full comment body
+    text_to_search = code_blocks[0] if code_blocks else comment.body
+    
+    # Now search for the repaid command
+    m = re.search(r"\$repaid\s+(\d+)\s+(\d+(?:\.\d+)?)\s+([A-Z]{3})", text_to_search, re.IGNORECASE)
+    if not m: 
+        return
+        
+    borrower = comment.author.name.lower()
+    loan_id = m.group(1)
+    repay_amt = Decimal(m.group(2))  # Use Decimal for financial calculations
+    currency = m.group(3).upper()
+    
+    conn = get_db_connection()
+    if not conn:
+        return
+        
+    try:
+        cur = conn.cursor()
+        
+        # Verify loan exists and borrower is correct
+        cur.execute('''
+            SELECT lender, amount, amount_repaid, currency, status 
+            FROM loans 
+            WHERE id=%s AND borrower=%s
+        ''', (loan_id, borrower))
+        
+        res = cur.fetchone()
+        if not res:
+            comment.reply(f"Error: No loan ID {loan_id} found where you are the borrower.")
+            return
+            
+        lender, total_amt, already_repaid, loan_currency, status = res
+        
+        # Check currency match
+        if currency != loan_currency:
+            comment.reply(f"Error: Currency mismatch. The loan was in {loan_currency}, but you specified {currency}.")
+            return
+            
+        # Check if already fully repaid
+        if status == "repaid":
+            comment.reply("Error: This loan has already been fully repaid.")
+            return
+            
+        # Calculate new repayment amount and status
+        new_total = already_repaid + repay_amt
+        new_status = "repaid" if new_total >= total_amt else "partially_repaid"
+        remaining = max(total_amt - new_total, Decimal("0.00"))
+        
+        # Update loan record
+        cur.execute('''
+            UPDATE loans 
+            SET amount_repaid=%s, status=%s, last_updated=%s 
+            WHERE id=%s
+        ''', (new_total, new_status, datetime.now(), loan_id))
+        
+        # Update user stats
+        cur.execute('''
+            UPDATE users 
+            SET amount_repaid=amount_repaid+%s, last_updated=%s 
+            WHERE username=%s
+        ''', (repay_amt, datetime.now(), borrower))
+        
+        # If fully repaid, update unpaid counts
+        if new_status == "repaid":
+            cur.execute('''
+                UPDATE users 
+                SET unpaid_loans=GREATEST(unpaid_loans-1,0), 
+                    unpaid_amount=GREATEST(unpaid_amount-%s,0), 
+                    last_updated=%s 
+                WHERE username=%s
+            ''', (total_amt, datetime.now(), borrower))
+        
+        conn.commit()
+        
+        # Prepare response
+        response = f"u/{borrower} repaid {repay_amt:.2f} {currency} to u/{lender}.\n\n"
+        response += f"Payment of {repay_amt:.2f} {currency} recorded.\n\n"
+        response += "|Loan ID|Lender|Borrower|Original Amount|Amount Repaid|Remaining|\n"
+        response += "|:--:|:--:|:--:|:--:|:--:|:--:|\n"
+        response += f"|{loan_id}|{lender}|{borrower}|{total_amt:.2f} {currency}|{new_total:.2f} {currency}|{remaining:.2f} {currency}|\n\n"
+        
+        if remaining > 0:
+            response += f"You still need to repay {remaining:.2f} {currency} to complete this loan."
+        else:
+            response += "This loan has now been fully repaid! Thank you!"
+        
+        comment.reply(response)
+        logger.info(f"Repayment processed: {borrower} repaid {repay_amt:.2f} {currency} to {lender}")
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error processing repaid command: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        cur.close()
+        conn.close()
 
 if __name__ == "__main__":
     if not init_database():
